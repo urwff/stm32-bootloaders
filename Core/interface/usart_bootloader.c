@@ -8,15 +8,18 @@
 
 #define RECEIVE_BUFFER_SIZE 512
 static uint8_t receive_buffer[RECEIVE_BUFFER_SIZE] = {0};
-volatile uint16_t receive_size = 0;
-uint16_t receive_len = 0;
+volatile uint16_t usart_receive_size = 0;
+
+uint16_t buffer_receive_size = 0;
 uint32_t flash_offset = 0;
 
+uint8_t last_byte = 0;
+uint8_t last_byte_flag = 0;
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
   if (huart->Instance == USART1) {
-    receive_size = Size;
+    usart_receive_size = Size;
+    buffer_receive_size += Size;
     uint32_t current_page = 0;
-    receive_len += Size;
     HAL_FLASH_Unlock();
     // 1. 判断a区是否需要擦除
     uint8_t need_erase = 0;
@@ -41,6 +44,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
       HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
     }
     // 写入
+    // 问题：
+    // 1. flash写入时，只能先擦除，然后才能写入，否则会出错
+    // 2. 如果遇到字节边界，需要特殊处理
+    // 3. 如 发送hello world，到末尾剩余d时，需要与下次发送的字节拼接再写入
     for (uint16_t i = 0; i < Size; i++) {
       uint16_t receive_data;
       if (i + 1 < Size) {
@@ -165,24 +172,75 @@ uint8_t USART_Bootloader_EraseFlash(uint32_t startAddress, uint32_t length) {
   return 0; // 成功
 }
 
-uint8_t USART_Bootloader_WriteFlash(uint32_t address, const uint8_t *data,
-                                    uint32_t length) {
+uint8_t USART_Bootloader_WriteFlash(uint32_t address,
+                                    const uint8_t *buffer_data,
+                                    uint32_t buffer_receive_length) {
+  // 问题：
+  // 1. flash写入时，只能先擦除，然后才能写入，否则会出错
+  // 2. 如果遇到字节边界，需要特殊处理
+  // 3. 如 发送hello world，到末尾剩余d时，需要与下次发送的字节拼接再写入
   HAL_FLASH_Unlock();
-
-  for (uint32_t i = 0; i < length; i += 2) {
-    uint16_t halfword_data;
-
-    // 处理奇数长度（最后一个字节）
-    if (i + 1 >= length) {
-      halfword_data = (uint16_t)data[i] | 0xFF00; // 用 0xFF 填充
-    } else {
-      halfword_data = (uint16_t)data[i] | ((uint16_t)data[i + 1] << 8);
+  // 遍历接受到的数据 如果接受到的数据是偶数 则写入 如果是奇数
+  // 则与下一个字节拼接再写入
+  // 偶数个数据
+  // 上次剩余数据
+  if (last_byte_flag != 0) {
+    // 这次的数据 + 剩余数据 = 偶数个数据
+    if (buffer_receive_length % 2 == 0) {
+      // 写入全部数据
+      for (uint32_t i = 0; i < buffer_receive_length; i += 2) {
+        // buffer_receive_length如果是偶数的话 就刚刚好 0 1
+        if (i + 1 < buffer_receive_length) {
+          uint16_t receive_data =
+              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
+          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
+                            receive_data);
+        }
+      }
+      last_byte_flag = 0;
     }
-
-    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
-                          halfword_data) != HAL_OK) {
-      HAL_FLASH_Lock();
-      return 1; // 错误
+    // 这次的数据 + 剩余数据 = 奇数个数据
+    else if (buffer_receive_length % 2 != 0) {
+      // 写入偶数个字节
+      for (uint32_t i = 0; i < buffer_receive_length; i += 2) {
+        // 只写到偶数个字节
+        // buffer_receive_length如果是奇数的话 就刚刚好 0 1 3
+        if (i + 1 < buffer_receive_length) {
+          uint16_t receive_data =
+              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
+          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
+                            receive_data);
+        }
+      }
+      last_byte = buffer_data[buffer_receive_length - 1];
+      last_byte_flag = 1;
+    }
+  }
+  // 上次没有剩余数据
+  else {
+    // 这次的数据是 偶数个数据 则写入所有数据
+    if (buffer_receive_length % 2 == 0) {
+      for (uint32_t i = 0; i < buffer_receive_length; i += 2) {
+        if (i + 1 < buffer_receive_length) {
+          uint16_t receive_data =
+              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
+          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
+                            receive_data);
+        }
+      }
+      last_byte_flag = 0;
+    } else {
+      // 奇数个数据 则只写入偶数个字节
+      for (uint32_t i = 0; i < buffer_receive_length - 1; i += 2) {
+        if (i + 1 < buffer_receive_length) {
+          uint16_t receive_data =
+              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
+          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
+                            receive_data);
+        }
+      }
+      last_byte = buffer_data[buffer_receive_length - 1];
+      last_byte_flag = 1;
     }
   }
 
