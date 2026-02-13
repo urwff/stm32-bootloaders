@@ -53,7 +53,7 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-extern volatile uint16_t receive_size;
+extern volatile uint16_t buffer_receive_size;
 
 /* USER CODE END PFP */
 
@@ -101,7 +101,7 @@ int main(void) {
   while (1) {
     /* USER CODE END WHILE */
     char msg[32];
-    int len = sprintf(msg, "%d\n", receive_size);
+    int len = sprintf(msg, "%d\n", buffer_receive_size);
     HAL_UART_Transmit(&huart1, (uint8_t *)msg, len, HAL_MAX_DELAY);
     HAL_Delay(1000);
     /* USER CODE BEGIN 3 */

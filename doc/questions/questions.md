@@ -39,24 +39,43 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 ---
 
-## 自定义 Bootloader 与系统 Bootloader 的区别
+## 自定义 Bootloader 与系统 Bootloader 的区别（含 BOOT0/BOOT1）
 
-- **日期**：2026-02-10
+- **日期**：2026-02-10（更新：2026-02-13）
 - **分类**：#知识盲点
-- **技术**：STM32, Bootloader, BOOT0
+- **技术**：STM32, Bootloader, BOOT0, BOOT1
 
 ### 问题描述
 
-不清楚自己写的自定义 Bootloader 和 STM32 内置的系统 Bootloader（ROM 中的）的区别，误以为需要拉高 BOOT0 引脚才能进入自己的 Bootloader。
+不清楚自己写的自定义 Bootloader 和 STM32 内置的系统 Bootloader（ROM 中的）的区别，误以为需要拉高 BOOT0 引脚或配置 BOOT1 才能进入自己的 Bootloader。
 
-### 解决方案
+### STM32F1 完整启动模式表
+
+| BOOT0 | BOOT1 | 启动位置 | 说明 |
+|-------|-------|---------|------|
+| 0 | x（任意） | **主 Flash**（0x08000000） | 正常运行模式，从 Flash 加载用户程序 |
+| 1 | 0 | **System Memory**（ROM） | 进入 ST 原厂系统 Bootloader，支持串口/USB 烧录 |
+| 1 | 1 | **内置 SRAM**（0x20000000） | 从 SRAM 启动，通常用于调试 |
+
+> **BOOT1 只在 BOOT0=1 时才有意义**。当 BOOT0=0 时，无论 BOOT1 接高还是接低，MCU 都从主 Flash 启动。
+
+### 自定义 Bootloader vs 系统 Bootloader
 
 | 类型 | 位置 | BOOT0 | 进入方式 |
 |------|------|-------|---------|
-| 系统 Bootloader | ROM（出厂固化） | BOOT0=1 | 拉高 BOOT0 + 复位 |
+| 系统 Bootloader | ROM（出厂固化） | BOOT0=1, BOOT1=0 | 拉高 BOOT0 + 复位 |
 | 自定义 Bootloader | Flash 0x08000000 | BOOT0=0 | 正常上电启动即可 |
 
-自定义 Bootloader 就是一个普通 Flash 程序，MCU 上电后从 Flash 启动，先运行 Bootloader，再由 Bootloader 决定是否跳转到 APP（0x08004000）。**不需要动 BOOT0 引脚。**
+### 实际测试接线
+
+- **BOOT0 接 GND（或拉低）**：确保从 Flash 启动
+- **BOOT1 无需关心**：BOOT0=0 时 BOOT1 被忽略
+- **首次烧录**：用 ST-Link 将你的 Bootloader 烧入 Flash
+- **后续更新**：上电后 Bootloader 自动运行，通过 USART1 接收应用固件
+
+### 解决方案
+
+自定义 Bootloader 就是一个普通 Flash 程序，MCU 上电后从 Flash 启动，先运行 Bootloader，再由 Bootloader 决定是否跳转到 APP（0x08004000）。**不需要动 BOOT0/BOOT1 引脚，保持默认从 Flash 启动即可。**
 
 ---
 
@@ -138,5 +157,183 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 3. **Step 3: 存留残余（Remainder）**：处理完所有成对数据后，如果最后还剩 1 个字节，存入缓存供下次使用。
 
 **心得**：优秀的嵌入式逻辑应该像流水线一样处理数据，而不是通过复杂的条件判断去“硬套”各种排列组合。
+
+---
+
+## 如何建立严谨的底层逻辑思维
+
+- **日期**：2026-02-12
+- **分类**：#经验总结 | #成长记录
+- **技术**：逻辑设计, 嵌入式开发, 严谨性训练
+
+### 背景信息
+
+- **正在实现的功能**：USART Bootloader 的 Flash 写入逻辑
+- **当前操作**：反思为什么逻辑设计容易出现“不严谨”的情况
+
+### 核心启示：严谨性四心法
+
+1.  **从“状态枚举”向“流式处理”转变**：
+    - 避开复杂的嵌套 `if-else`。
+    - 将数据看作一条流，设计一个通用的线性处理过程。
+    - **逻辑准则**：代码分支越少，潜伏的 Bug 越少。
+
+2.  **极端边界推演（0, 1, 2 法则）**：
+    - 每次写完涉及下标的代码，手动模拟长度为 **0（空包）**、**1（单字节包）**、**2（刚好成对）** 的情况。
+    - 如果这三个点能通，逻辑通常是稳定的。
+
+3.  **现状优于猜测（State vs Guess）**：
+    - 永远相信指针的位置（如 `i < len`），而不是推算出来的属性（如 `len % 2`）。
+    - 指针停在哪里，哪里就是真实的现场。
+
+4.  **纸上推演（Dry Run）**：
+    - 涉及位偏移和下标计算时，必须先在笔纸上画出内存分布。
+    - **金句**：如果你在草稿纸上都画不顺逻辑，写出的代码一定会崩。
+
+### 总结
+
+严谨性不是天赋，而是一种受过训练的**肌肉记忆**。在底层开发中，“慢即是快”，花时间推演逻辑能节省数倍的硬件调试时间。
+
+---
+
+## Flash 跨页擦除逻辑设计
+
+- **日期**：2026-02-13
+- **分类**：#已解决 | #经验总结
+- **技术**：STM32, Flash, 嵌入式开发, 逻辑设计
+
+### 背景信息
+
+- **正在实现的功能**：USART Bootloader 的 Flash 按页擦除功能（`USART_Bootloader_EraseFlash`）
+- **当前操作**：需要在写入前检查目标区域是否有脏数据，如果有则擦除对应页，并支持跨页擦除
+
+### 问题描述
+
+从单页擦除升级到跨页擦除时，遇到了三个关键问题：
+1. **页地址计算错误**：最初用 `appStartAddress - (offset - appStartAddress) % FLASH_PAGE_SIZE` 计算页起始地址，公式逻辑不对
+2. **只擦除一页**：只找到第一个脏字节就 break，擦除操作放在循环外面，导致只擦了最后一页
+3. **死循环**：改成 `while` 后，如果某页全是 `0xFF`（干净页），循环变量不推进，导致无限循环
+
+### 问题代码
+
+```c
+// 版本1：页地址计算错误 + 只擦一页
+for (uint32_t i = 0; i < usart_buffer_length; i++) {
+    if (flash_data != 0xFF) {
+        erase_page_address =
+            appStartAddress - (flash_data_offset - appStartAddress) % FLASH_PAGE_SIZE;
+        break;
+    }
+}
+// 擦除在循环外 → 只擦最后一页
+
+// 版本2：死循环风险
+while (flash_data_offset < usart_buffer_length) {
+    for (; i < FLASH_PAGE_SIZE; i++) { // i 不跨页，干净页不推进 → 死循环
+        ...
+    }
+}
+```
+
+### 解决代码
+
+```c
+uint32_t i = 0;
+HAL_FLASH_Unlock();
+while (i < usart_buffer_length) {
+    uint32_t address = appStartAddress + i;
+    uint32_t page_StartAddress = address - (address % FLASH_PAGE_SIZE);
+    uint32_t page_EndAddress = page_StartAddress + FLASH_PAGE_SIZE;
+    uint8_t need_erase = 0;
+
+    for (uint32_t j = address; j < page_EndAddress && (j - appStartAddress) < usart_buffer_length; j++) {
+        if (*(volatile uint8_t *)(j) != 0xFF) {
+            need_erase = 1;
+            break;
+        }
+    }
+    if (need_erase) {
+        // 立即擦除当前页
+        HAL_FLASHEx_Erase(&EraseInit, &PageError);
+    }
+    i += FLASH_PAGE_SIZE; // 无论是否擦除，都跳到下一页
+}
+HAL_FLASH_Lock();
+```
+
+### 深度复盘 (Deep Analysis)
+
+- **思维误区**：习惯了单次操作的思维，把"找到一个就退出"的模式直接套到了需要遍历多页的场景。擦除放在循环外是单页思维的残留。
+- **模式识别**：这是"按块步进遍历"模式——处理 Flash/磁盘等按页/扇区组织的存储时，循环变量应该以块大小为步长推进，而不是逐字节 `i++`。
+- **防御机制**：
+  1. 循环内的操作应该是"自包含"的——每轮循环完成一个完整的"检查+操作"单元
+  2. 确保每条路径（找到脏数据 / 未找到）都能推进循环变量，避免死循环
+  3. `appStartAddress` 假设为页对齐地址，若不确定应加 `assert` 检查
+
+### 解决方案
+
+采用"按页步进 + 页内扫描 + 即时擦除"的三段式结构：每轮 `while` 处理一页，用内层 `for` 扫描该页是否有脏数据，发现即擦除，最后 `i += FLASH_PAGE_SIZE` 无条件跳到下一页。
+
+---
+
+## 先画后写：写函数前的三问法
+
+- **日期**：2026-02-13
+- **分类**：#经验总结 | #成长记录
+- **技术**：逻辑设计, 嵌入式开发, 方法论
+
+### 背景信息
+
+- **正在实现的功能**：USART Bootloader 的 Flash 跨页擦除功能
+- **当前操作**：擦除函数本身逻辑正确，但集成到回调时漏掉了"调用擦除"和"地址偏移"，导致整体流程不通
+
+### 问题描述
+
+擦除函数 `USART_Bootloader_EraseFlash` 独立来看逻辑正确，但放到整体代码中时：
+1. 回调里根本没调用擦除函数（只有注释）
+2. `WriteFlash` 写入地址没有加 `flash_offset`，每次都写到同一个位置
+3. Flash 解锁/上锁在三层（回调、擦除、写入）中重复
+
+**根本原因**：写函数时只关注了"这个函数内部怎么做"，没有先想清楚"这个函数在整体流程中扮演什么角色"。
+
+### 深度复盘 (Deep Analysis)
+
+- **思维误区**：陷入了"局部完美主义"——花大量精力打磨单个函数的内部逻辑，却忽视了它与上下游的连接关系
+- **模式识别**：这是"只见树木不见森林"的错误——函数写完了，但没有检查调用链是否完整
+- **防御机制**：采用"先画后写"方法论（见下方）
+
+### 解决方案：先画后写（三问法）
+
+**写任何函数之前，花 1 分钟回答三个问题：**
+
+| 问题 | 含义 | 示例（擦除函数） |
+|------|------|-----------------|
+| ① 输入是什么？ | 谁调用我？参数从哪来？ | 回调调用，传入 `APP_START_ADDRESS + flash_offset` 和 `Size` |
+| ② 输出到哪？ | 结果给谁用？影响什么状态？ | 擦除对应的 Flash 页，为后续写入做准备 |
+| ③ 画调用链 | 完整的数据流是什么？ | 中断 → 擦除 → 写入 → 更新偏移 → 重新接收 |
+
+**示例调用链草图：**
+
+```
+串口中断触发
+  └→ HAL_UARTEx_RxEventCallback(Size)
+       ├→ EraseFlash(APP_START_ADDRESS + flash_offset, Size)   // 先擦
+       ├→ WriteFlash(APP_START_ADDRESS + flash_offset, buf, Size) // 再写
+       ├→ flash_offset += Size                                    // 更新
+       └→ ReceiveToIdle_IT(...)                                   // 继续收
+```
+
+### 底层开发通用思维模式速查
+
+| 思维模式 | 何时使用 | 关键特征 |
+|---------|---------|---------|
+| 按块步进 | Flash 擦除/写入、DMA 传输 | 循环步长 = 块大小，不是 `i++` |
+| 流式处理 | 串口数据、协议解析 | 不关心包边界，只关心"数据对"的提取 |
+| 状态机 | 协议交互、多阶段流程 | 用状态变量驱动，每个状态只做一件事 |
+| 先画后写 | 任何涉及地址/偏移/多函数协作的场景 | 动手前画出调用链和内存布局 |
+
+### 核心心得
+
+**快和严谨不矛盾**——"先画后写"看起来多花了 1 分钟画图，但能省掉后面 30 分钟的调试。速度是严谨的副产品，会随着经验自然提升。
 
 ---

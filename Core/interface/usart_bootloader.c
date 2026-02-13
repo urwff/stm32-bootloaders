@@ -7,66 +7,31 @@
 #include <string.h>
 
 #define RECEIVE_BUFFER_SIZE 512
-static uint8_t receive_buffer[RECEIVE_BUFFER_SIZE] = {0};
-volatile uint16_t usart_receive_size = 0;
+static uint8_t usart_receive_buffer[RECEIVE_BUFFER_SIZE] = {0};
+volatile uint16_t usart_buffer_length = 0; // 表示累计收到的字节长度
 
-uint16_t buffer_receive_size = 0;
+uint16_t buffer_receive_size = 0; // 表示当前收到的字节长度
 uint32_t flash_offset = 0;
 
 uint8_t last_byte = 0;
 uint8_t last_byte_flag = 0;
+
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
   if (huart->Instance == USART1) {
-    usart_receive_size = Size;
-    buffer_receive_size += Size;
-    uint32_t current_page = 0;
-    HAL_FLASH_Unlock();
+    usart_buffer_length = Size;
+
     // 1. 判断a区是否需要擦除
-    uint8_t need_erase = 0;
-    for (uint16_t i = 0; i < Size; i++) {
-      uint8_t data =
-          *(volatile uint8_t *)(APP_START_ADDRESS + flash_offset + i);
-      if (data != 0xFF) {
-        need_erase = 1;
-        current_page = (APP_START_ADDRESS + flash_offset + i) -
-                       (APP_START_ADDRESS + flash_offset + i) % FLASH_PAGE_SIZE;
-        break;
-      }
-    }
-    // 2. 擦除
-    if (need_erase == 1) {
-      FLASH_EraseInitTypeDef EraseInitStruct;
-      EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-      EraseInitStruct.PageAddress = current_page;
-      EraseInitStruct.NbPages = 1;
-      uint32_t PageError = 0;
-      EraseInitStruct.Banks = FLASH_BANK_1;
-      HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
-    }
-    // 写入
-    // 问题：
-    // 1. flash写入时，只能先擦除，然后才能写入，否则会出错
-    // 2. 如果遇到字节边界，需要特殊处理
-    // 3. 如 发送hello world，到末尾剩余d时，需要与下次发送的字节拼接再写入
-    for (uint16_t i = 0; i < Size; i++) {
-      uint16_t receive_data;
-      if (i + 1 < Size) {
-        receive_data = receive_buffer[i] | (receive_buffer[i + 1] << 8);
-        HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
-                          APP_START_ADDRESS + flash_offset + i, receive_data);
-        i++;
-      } else {
-        receive_data = receive_buffer[i] | (0x00ff << 8);
-        HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
-                          APP_START_ADDRESS + flash_offset + i, receive_data);
-      }
-    }
+    USART_Bootloader_EraseFlash(APP_START_ADDRESS + flash_offset,
+                                usart_buffer_length);
+    // 2. 写入
+    USART_Bootloader_WriteFlash(APP_START_ADDRESS + flash_offset,
+                                usart_receive_buffer, Size);
     // 3. 更新偏移量
     flash_offset += Size;
-    HAL_FLASH_Lock();
     // 4. 重置缓冲区并重新开始接收
-    memset(receive_buffer, 0, RECEIVE_BUFFER_SIZE);
-    HAL_UARTEx_ReceiveToIdle_IT(&huart1, receive_buffer, RECEIVE_BUFFER_SIZE);
+    memset(usart_receive_buffer, 0, RECEIVE_BUFFER_SIZE);
+    HAL_UARTEx_ReceiveToIdle_IT(&huart1, usart_receive_buffer,
+                                RECEIVE_BUFFER_SIZE);
   }
 }
 
@@ -78,7 +43,8 @@ void USART_Bootloader_Init(void) {
   __HAL_UART_CLEAR_NEFLAG(&huart1);
 
   // 开始接收
-  HAL_UARTEx_ReceiveToIdle_IT(&huart1, receive_buffer, RECEIVE_BUFFER_SIZE);
+  HAL_UARTEx_ReceiveToIdle_IT(&huart1, usart_receive_buffer,
+                              RECEIVE_BUFFER_SIZE);
 }
 
 void USART_Bootloader_Process(void) {
@@ -113,59 +79,44 @@ bool USART_Bootloader_JumpToApplication(void) {
   }
   return false;
 }
-
-uint8_t USART_Bootloader_EraseFlash(uint32_t startAddress, uint32_t length) {
+/**
+ * @brief 按页擦除flash
+ * @param AppAddress 应用块的起始地址
+ * @param usart_buffer_length 累计收到的字节长度
+ *
+ * @return uint8_t
+ */
+uint8_t USART_Bootloader_EraseFlash(uint32_t appStartAddress,
+                                    uint32_t usart_buffer_length) {
+  // 1. 擦除未擦除页 如果发现到该页存在未擦除的字节，就擦除该页
+  uint32_t i = 0;
   HAL_FLASH_Unlock();
 
-  FLASH_EraseInitTypeDef EraseInitStruct;
-  uint32_t PageError = 0;
+  while (i < usart_buffer_length) {
+    uint32_t address = appStartAddress + i;
+    uint32_t page_StartAddress = address - (address % FLASH_PAGE_SIZE);
+    uint32_t page_EndAddress = page_StartAddress + FLASH_PAGE_SIZE;
+    uint8_t need_erase = 0;
 
-  // 计算页数
-  // 注意：为了安全，此简单架构假设 startAddress 是页对齐的
-  // 或者检查对齐情况。
-  // 如果长度迫使跨入新页面，则应擦除该页面。
-  // 但是，如果我们顺序写入小块，盲目擦除后续页面可能会很危险。
-  // 安全策略：仅当处于页面*开始*位置时才擦除*当前*页面。
-  // 如果数据跨越页面，我们从技术上讲
-  // 也需要擦除下一个页面，但前提是我们确定是第一次进入该页面。
-  // 鉴于回调逻辑：如果 (current_address % FLASH_PAGE_SIZE) == 0 -> 擦除
-  // 我们假设主机发送的数据块可能对齐也可能不对齐，但通常包大小 < 页大小。
-  // 让我们实现一个通用的擦除函数，擦除 [start, start+len] 触及的所有页面，
-  // 但需要谨慎调用。
-
-  uint32_t endAddress = startAddress + length - 1;
-  uint32_t startPage = startAddress & ~(FLASH_PAGE_SIZE - 1);
-  uint32_t endPage = endAddress & ~(FLASH_PAGE_SIZE - 1);
-
-  // 安全性：仅当请求的 startAddress 是页面的开头时才进行擦除
-  // 否则，如果我们正在向页面追加内容，可能会擦除刚刚写入的数据。
-  if (startAddress != startPage) {
-    // 我们处于页面的中间。假设我们在开始
-    // 写入此页面时它已被擦除。除非我们跨越了页边界？
-    if (startPage != endPage) {
-      // 我们跨越了边界！我们必须擦除下一页。
-      // 但我们不应该擦除第一页（它包含数据）。
-      startPage = startPage + FLASH_PAGE_SIZE; // 从 *下一页* 开始擦除
-    } else {
-      // 整个范围都在一个应该已经被擦除的页面内。
-      HAL_FLASH_Lock();
-      return 0; // 无需擦除
+    for (uint32_t j = address;
+         j < page_EndAddress && (j - appStartAddress) < usart_buffer_length;
+         j++) {
+      uint8_t flash_data = *(volatile uint8_t *)(j);
+      if (flash_data != 0xFF) {
+        need_erase = 1;
+        break;
+      }
     }
-  }
-
-  if (endPage < startPage) {
-    HAL_FLASH_Lock();
-    return 0; // 无需擦除
-  }
-
-  EraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-  EraseInitStruct.PageAddress = startPage;
-  EraseInitStruct.NbPages = (endPage - startPage) / FLASH_PAGE_SIZE + 1;
-  EraseInitStruct.Banks = FLASH_BANK_1;
-
-  if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
-    HAL_FLASH_Lock();
-    return 1; // 错误
+    if (need_erase) {
+      uint32_t PageError = 0;
+      FLASH_EraseInitTypeDef EraseInit;
+      EraseInit.Banks = FLASH_BANK_1;
+      EraseInit.TypeErase = FLASH_TYPEERASE_PAGES;
+      EraseInit.PageAddress = page_StartAddress;
+      EraseInit.NbPages = 1;
+      HAL_FLASHEx_Erase(&EraseInit, &PageError);
+    }
+    i += FLASH_PAGE_SIZE;
   }
 
   HAL_FLASH_Lock();
@@ -180,68 +131,27 @@ uint8_t USART_Bootloader_WriteFlash(uint32_t address,
   // 2. 如果遇到字节边界，需要特殊处理
   // 3. 如 发送hello world，到末尾剩余d时，需要与下次发送的字节拼接再写入
   HAL_FLASH_Unlock();
-  // 遍历接受到的数据 如果接受到的数据是偶数 则写入 如果是奇数
-  // 则与下一个字节拼接再写入
-  // 偶数个数据
-  // 上次剩余数据
+  // 拼接上次剩余的一个字节
+  uint16_t i = 0;
+
   if (last_byte_flag != 0) {
-    // 这次的数据 + 剩余数据 = 偶数个数据
-    if (buffer_receive_length % 2 == 0) {
-      // 写入全部数据
-      for (uint32_t i = 0; i < buffer_receive_length; i += 2) {
-        // buffer_receive_length如果是偶数的话 就刚刚好 0 1
-        if (i + 1 < buffer_receive_length) {
-          uint16_t receive_data =
-              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
-          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
-                            receive_data);
-        }
-      }
-      last_byte_flag = 0;
-    }
-    // 这次的数据 + 剩余数据 = 奇数个数据
-    else if (buffer_receive_length % 2 != 0) {
-      // 写入偶数个字节
-      for (uint32_t i = 0; i < buffer_receive_length; i += 2) {
-        // 只写到偶数个字节
-        // buffer_receive_length如果是奇数的话 就刚刚好 0 1 3
-        if (i + 1 < buffer_receive_length) {
-          uint16_t receive_data =
-              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
-          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
-                            receive_data);
-        }
-      }
-      last_byte = buffer_data[buffer_receive_length - 1];
-      last_byte_flag = 1;
-    }
+    uint16_t receive_data = last_byte | (buffer_data[0] << 8);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address, receive_data);
+    address += 2;
+    i = 1;
+    last_byte_flag = 0;
   }
-  // 上次没有剩余数据
-  else {
-    // 这次的数据是 偶数个数据 则写入所有数据
-    if (buffer_receive_length % 2 == 0) {
-      for (uint32_t i = 0; i < buffer_receive_length; i += 2) {
-        if (i + 1 < buffer_receive_length) {
-          uint16_t receive_data =
-              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
-          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
-                            receive_data);
-        }
-      }
-      last_byte_flag = 0;
-    } else {
-      // 奇数个数据 则只写入偶数个字节
-      for (uint32_t i = 0; i < buffer_receive_length - 1; i += 2) {
-        if (i + 1 < buffer_receive_length) {
-          uint16_t receive_data =
-              ((uint16_t)buffer_data[i]) | ((uint16_t)buffer_data[i + 1] << 8);
-          HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address + i,
-                            receive_data);
-        }
-      }
-      last_byte = buffer_data[buffer_receive_length - 1];
-      last_byte_flag = 1;
-    }
+
+  for (; i + 1 < buffer_receive_length; i += 2) {
+    uint16_t receive_data = buffer_data[i] | (buffer_data[i + 1] << 8);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, address, receive_data);
+    address += 2;
+  }
+
+  // 0 1 2 3
+  if (i < buffer_receive_length) {
+    last_byte = buffer_data[buffer_receive_length - 1];
+    last_byte_flag = 1;
   }
 
   HAL_FLASH_Lock();
